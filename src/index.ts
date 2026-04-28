@@ -1,71 +1,133 @@
-import { DurableObject } from "cloudflare:workers";
-
 /**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
+ * ms.tools — Draw & Guess · SQLite-backed Durable Object Signalling
  */
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
-
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(): Promise<string> {
-		let result = this.ctx.storage.sql
-			.exec("SELECT 'Hello, World!' as greeting")
-			.one() as { greeting: string };
-		return result.greeting;
-	}
+export interface Env {
+  MY_DURABLE_OBJECT: DurableObjectNamespace;
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a `DurableObjectId` for an instance of the `MyDurableObject`
-		// class. The name of class is used to identify the Durable Object.
-		// Requests from all Workers to the instance named
-		// will go to a single globally unique Durable Object instance.
-		const id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(
-			new URL(request.url).pathname,
-		);
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// Create a stub to open a communication channel with the Durable
-		// Object instance.
-		const stub = env.MY_DURABLE_OBJECT.get(id);
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance
-		const greeting = await stub.sayHello();
+    // All peers share the 'global' DO instance to find each other
+    const id = env.MY_DURABLE_OBJECT.idFromName('global');
+    const stub = env.MY_DURABLE_OBJECT.get(id);
+    return stub.fetch(request);
+  },
+};
 
-		return new Response(greeting);
-	},
-} satisfies ExportedHandler<Env>;
+export class MyDurableObject implements DurableObject {
+  // In-memory sessions map (wiped on DO restart, but sockets reconnect)
+  private sessions = new Map<string, WebSocket>();
+
+  constructor(public state: DurableObjectState, public env: Env) {
+    // 1. Initialize the SQLite table
+    this.state.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS peers (
+        id TEXT PRIMARY KEY,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // WebSocket Signalling
+    if (request.headers.get('Upgrade') === 'websocket') {
+      const peerId = url.searchParams.get('id');
+      if (!peerId) return new Response('Missing id', { status: 400 });
+
+      const [client, server] = Object.values(new WebSocketPair());
+
+      // Use Hibernation API: tags the socket for the 'webSocketMessage' handler
+      this.state.acceptWebSocket(server, [peerId]);
+      this.sessions.set(peerId, server);
+
+      this._send(server, { type: 'OPEN' });
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    // REST: Get new ID
+    if (request.method === 'GET' && /\/id\/?$/.test(url.pathname)) {
+      const newId = randomId();
+      // 2. Persist the generated ID to SQLite
+      this.state.storage.sql.exec("INSERT INTO peers (id) VALUES (?)", newId);
+      
+      return new Response(JSON.stringify(newId), {
+        headers: corsHeaders('application/json'),
+      });
+    }
+
+    return new Response('Not found', { status: 404, headers: corsHeaders() });
+  }
+
+  /**
+   * HIBERNATION HANDLERS
+   * Required for Durable Objects on the Workers Free Plan.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    const [peerId] = this.state.getTags(ws);
+    let msg: any;
+    try {
+      msg = JSON.parse(message as string);
+    } catch {
+      return;
+    }
+
+    if (msg.type === 'HEARTBEAT') {
+      this._send(ws, { type: 'HEARTBEAT' });
+      return;
+    }
+
+    if (msg.dst) {
+      msg.src = peerId;
+      const dstSocket = this.sessions.get(msg.dst);
+      if (dstSocket && dstSocket.readyState === WebSocket.OPEN) {
+        this._send(dstSocket, msg);
+      } else {
+        this._send(ws, { type: 'EXPIRE', src: msg.dst });
+      }
+    }
+  }
+
+  async webSocketClose(ws: WebSocket) {
+    const [peerId] = this.state.getTags(ws);
+    this.sessions.delete(peerId);
+  }
+
+  async webSocketError(ws: WebSocket) {
+    const [peerId] = this.state.getTags(ws);
+    this.sessions.delete(peerId);
+  }
+
+  private _send(ws: WebSocket, obj: object) {
+    try {
+      ws.send(JSON.stringify(obj));
+    } catch (e) {}
+  }
+}
+
+// --- Helpers ---
+
+function randomId(): string {
+  const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, b => CHARS[b % CHARS.length]).join('');
+}
+
+function corsHeaders(contentType?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Upgrade, Connection',
+  };
+  if (contentType) h['Content-Type'] = contentType;
+  return h;
+}
